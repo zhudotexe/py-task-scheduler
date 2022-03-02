@@ -1,12 +1,25 @@
 import asyncio
 import datetime
 import inspect
+import json
 import logging
-from typing import Callable, Coroutine, Dict, Optional, Union
+from typing import Callable, Coroutine, Dict, Optional, TextIO, Union
 
 from .task import Task
 
 log = logging.getLogger(__name__)
+
+
+class WaitUntil:
+    def __init__(self, target_task: Task):
+        self.target_time = target_task.when.timestamp()
+        self.waiter = asyncio.create_task(asyncio.sleep(target_task.time_until()))
+
+    def __await__(self):
+        yield from self.waiter
+
+    def cancel(self):
+        self.waiter.cancel()
 
 
 class Scheduler:
@@ -98,13 +111,61 @@ class Scheduler:
             log.exception(f"Task calling into {task.func_name!r} raised an exception on execution!")
 
 
-class WaitUntil:
-    def __init__(self, target_task: Task):
-        self.target_time = target_task.when.timestamp()
-        self.waiter = asyncio.create_task(asyncio.sleep(target_task.time_until()))
+class JSONSavingScheduler(Scheduler):
+    def __init__(self, fp):
+        super().__init__()
+        self.fp = fp
 
-    def __await__(self):
-        yield from self.waiter
+    # ==== save ====
+    async def save(self):
+        if self.tasks.empty():
+            open(self.fp, 'w').close()
+            return
 
-    def cancel(self):
-        self.waiter.cancel()
+        async with self.save_lock:
+            dest_file = open(self.fp, 'w', encoding='utf-8')
+            new_task_queue = asyncio.PriorityQueue()
+            while not self.tasks.empty():
+                task = await self.tasks.get()
+                await asyncio.get_event_loop().run_in_executor(None, self._write_task, dest_file, task)
+                await new_task_queue.put(task)
+            dest_file.close()
+            self.tasks = new_task_queue
+
+    @staticmethod
+    def _write_task(f: TextIO, task: Task):
+        data = {
+            "when": task.when.timestamp(),
+            "func_name": task.func_name,
+            "args": task.args,
+            "kwargs": task.kwargs
+        }
+        try:
+            line = json.dumps(data)
+        except (TypeError, ValueError):
+            log.warning(f"Could not save task (make sure the args are JSON-serializable!): {data!r}")
+            return
+        f.write(line)
+        f.write("\n")
+
+    # ==== load ====
+    def load(self):
+        try:
+            with open(self.fp, 'r', encoding='utf-8') as f:
+                for line in f:
+                    self._load_line(line)
+        except FileNotFoundError:
+            log.info(f"Task save file {self.fp!r} not found, no tasks loaded.")
+            return
+
+    def _load_line(self, line: str):
+        try:
+            data = json.loads(line)
+            self.submit(
+                datetime.datetime.fromtimestamp(data['when']),
+                str(data['func_name']),
+                *data['args'],
+                **data['kwargs']
+            )
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            log.warning(f"Invalid data found during task load, skipping: {line!r}")
